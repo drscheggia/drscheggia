@@ -1,0 +1,721 @@
+---
+title: "Association between ventilatory ratio and outcome in critically ill patients receiving mechanical ventilation."
+author: "Teresa Rozza"
+output:
+  pdf_document:
+    toc: yes
+    toc_depth: 3
+  html_document:
+    toc: yes
+    toc_depth: 2
+    toc_float: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+#set working directory
+workDir <- setwd("/Users/teresa/Desktop/MIMIC")
+```
+
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+# CRAN repository
+libraries <- c("readr", "dplyr", "sqldf", "devtools", "VIM", "mice", "tibble", "tidyverse", "corrplot", "DataExplorer", "arsenal", "Hmisc", "aod", "gtsummary", "neuralnet", "caret", "kernlab", "ggplot2", "NeuralNetTools", "kableExtra", "gmodels", "randomForest", "class","devtools", "e1071", "gridExtra", "class", "klaR")
+check.libraries <- is.element(libraries, installed.packages()[, 1])==FALSE 
+libraries.to.install <- libraries[check.libraries]
+                        if (length(libraries.to.install!=0)) {
+                        install.packages(libraries.to.install) }
+for (i in libraries) {
+    library(i, character.only = TRUE) }
+```
+
+
+# DATABASE PREPARATION 
+
+Mimic-III is a massive ICU database that collects data from ICU stay of patients. Informations are stored in different table and organized by time and ID (patients, admission and ICU stay). 
+
+![MIMIC-II structure, from "User Guide and Documentation for the MIMIC II Database, Clifford et al."](/Users/teresa/Desktop/MIMIC/structure.png)
+
+
+We have to create our own database with patients ventilated during >48h and variables from first and third day. So we begin by importing some datasets where our variables of interest are stored. 
+
+Information from patients are stored in different tables. In icustay_details and cenesus we have all the informations about ICU and hospital stay, as the differents IDs, hospital and ICU length of stay, gender and if patient died in ICU or hospital or not. 
+
+```{r}
+#import admission and patients dataframe and we select our variables of interest
+ICUSTAY <- read_csv("icustay_detail.csv")
+ICUSTAY <- sqldf('select "icustay_id", "subject_id", gender, "hadm_id", "hospital_los", "hospital_expire_flg", "icustay_intime", "icustay_outtime", "icustay_admit_age", "icustay_los", "icustay_expire_flg", height, "weight_first", "sofa_first" from ICUSTAY')
+```
+
+Diagnosis contains ICD9 diagnosis organized by importance during the hospital stay. 
+
+```{r}
+#import diagnosis ICD and dictionary and we select only the first admission's reason
+DIAGNOSIS <- read_csv("icd9.csv")
+DIAGNOSIS <- sqldf('select * from DIAGNOSIS where sequence = "1"')
+```
+Finally we need some laboratory variables and ventilatory setting that are contained in chartevents.
+
+```{r warning=FALSE}
+#import chartevents
+CHARTEVENTS <- read_csv("CHARTEVENTS.csv")
+```
+
+
+```{r}
+#select intubated patients
+LAB <- read_csv("labevents.csv")
+```
+
+
+```{r}
+IOT <- sqldf('select subject_id, icustay_id, itemid, charttime, value from LAB where value = "INTUBATED"')
+IOT <- sqldf('select distinct a.subject_id, a.icustay_id, a.icustay_intime, b.itemid, b.charttime from ICUSTAY as a inner join IOT as b on a.subject_id = b.subject_id and a.icustay_id = b.icustay_id and b.charttime')
+IOT$icustay_intime <- strptime(IOT$icustay_intime, "%d/%m/%Y %H:%M:%S")
+IOT$charttime <- strptime(IOT$charttime, "%d/%m/%Y %H:%M:%S")
+
+IOT <- IOT %>% group_by(icustay_id) %>% arrange(charttime) %>% filter(row_number()==1)
+```
+
+```{r}
+#we create our dataset with relevant information from patients
+PATIENTS <- sqldf('select distinct a.subject_id, a.icustay_id, b.code, b.description, a.gender, a.icustay_admit_age, a.height, a.weight_first, a.hospital_los, a.hospital_expire_flg, a.icustay_los, a.icustay_expire_flg, sofa_first, a.icustay_intime from ICUSTAY as a inner join DIAGNOSIS as b on a.subject_id = b.subject_id')
+PATIENTS$icustay_intime <- strptime(PATIENTS$icustay_intime, "%d/%m/%Y %H:%M:%S")
+PATIENTS$hospital_los <- PATIENTS$hospital_los/60/24 #trasform lenghth of stay in day
+PATIENTS$icustay_los <- round(PATIENTS$icustay_los/60/24, 0)
+PATIENTS$icustay_admit_age <- round(PATIENTS$icustay_admit_age, 0)
+PATIENTS <- filter(PATIENTS, icustay_admit_age > 17)
+PATIENTS <- rename(PATIENTS, age = icustay_admit_age, weight = weight_first, hosp_death = hospital_expire_flg, icu_death = icustay_expire_flg, sofa = sofa_first)
+PATIENTS <- semi_join(PATIENTS, IOT) #only intubated patients
+PATIENTS <- PATIENTS %>% group_by(icustay_id) %>% arrange(code) %>% filter(row_number()==1)
+head(PATIENTS) #final demographic dataset
+```
+
+```{r}
+#events in intubated patients only
+LABIOT <- semi_join(LAB, PATIENTS)
+LABIOT$charttime <- strptime(LABIOT$charttime, "%d/%m/%Y %H:%M:%S")
+LABIOT <- dplyr::select(LABIOT, subject_id, icustay_id, itemid, charttime, value, valuenum)
+EVENTIOT <- semi_join(CHARTEVENTS, PATIENTS)
+EVENTIOT$charttime <- strptime(EVENTIOT$charttime, "%d/%m/%Y %H:%M:%S")
+EVENTIOT <- dplyr::select(EVENTIOT, subject_id, icustay_id, itemid, charttime, value1, value1num)
+EVENTIOT <- rename(EVENTIOT, value = value1, valuenum = value1num)
+EVENTIOT <- EVENTIOT %>% bind_rows(LABIOT) #all of the events in IOT patients
+```
+
+```{r}
+#select our variable of interest
+EVENT <- EVENTIOT %>% filter(itemid %in% c(50016, 3835,3784, 50019,3837, 3785, 2981,3420,189,190,7570, 50013, 50014, 1817, 6149, 1818, 50010, 1531, 818, 1126, 780, 7459, 1673, 4753, 50018, 50090, 1525, 3750, 791, 715, 1448, 3050, 3080, 654, 2408, 2534, 681, 2420, 682, 683, 684, 50024, 534, 535, 505, 506, 6350, 50017, 131, 198, 1542, 1127, 861, 4200, 50316, 50468, 50428, 5661, 6256, 828, 4948, 50170, 2647, 2294, 52, 6702, 6590, 6927, 5702, 3167, 1670, 7352, 7454, 6273, 7085, 5764, 2129, 6691, 7504, 6819, 1731, 7968, 6268, 7263, 5630,779))
+EVENT <- EVENT %>% group_by(icustay_id, itemid) %>% arrange(charttime) %>% filter(row_number()==1)
+```
+
+
+```{r}
+EVENT <- EVENT %>% 
+              mutate(pCO2 = case_when(itemid == 50016 ~ valuenum, 
+                                      itemid == 3835 ~ valuenum,
+                                      itemid == 3784 ~ valuenum)
+                     ) %>% 
+              mutate(pO2 = case_when(itemid == 50019 ~ valuenum, 
+                                      itemid == 3837 ~ valuenum,
+                                      itemid == 3785 ~ valuenum,
+                                      itemid == 779 ~ valuenum)
+                     ) %>%
+              mutate(FiO2 = case_when(itemid == 2981 ~ valuenum, 
+                                     itemid == 3420 ~ valuenum, 
+                                     itemid == 189 ~ valuenum, 
+                                     itemid == 190 ~ valuenum,
+                                     itemid == 7570 ~ valuenum,
+                                     itemid == 50013 ~ valuenum,
+                                     itemid == 50014 ~ valuenum)
+                     ) %>%
+             mutate(lactate = case_when(itemid == 50010 ~ valuenum,
+                                      itemid == 1531 ~ valuenum,
+                                      itemid == 818 ~ valuenum)
+                    ) %>%
+            mutate(pH = case_when(itemid == 51126 ~ valuenum,
+                                  itemid == 780 ~ valuenum,
+                                  itemid == 7459 ~ valuenum,
+                                  itemid == 1673 ~ valuenum,
+                                  itemid == 4753 ~ valuenum,
+                                  itemid == 50018 ~ valuenum)
+                    ) %>%
+            mutate(creatinine = case_when(itemid == 50090 ~ valuenum,
+                                          itemid == 1525 ~ valuenum,
+                                          itemid == 3750 ~ valuenum,
+                                          itemid == 791 ~ valuenum)
+                    ) %>%
+             mutate(tidal_volume = case_when(itemid == 3050 ~ valuenum,
+                                            itemid == 3080 ~ valuenum,
+                                            itemid == 654 ~ valuenum,
+                                            itemid == 2408 ~ valuenum,
+                                            itemid == 2534 ~ valuenum,
+                                            itemid == 681 ~ valuenum,
+                                            itemid == 2420 ~ valuenum,
+                                            itemid == 682 ~ valuenum,
+                                            itemid == 683 ~ valuenum,
+                                            itemid == 684 ~ valuenum,
+                                            itemid == 50024 ~ valuenum)
+                    ) %>%
+             mutate(plateau = case_when(itemid == 534 ~ valuenum)
+                    ) %>%
+             mutate(peak = case_when(itemid == 535 ~ valuenum,
+                                     itemid == 505 ~ valuenum)
+            ) %>%
+            mutate(peep = case_when(itemid == 505 ~ valuenum,
+                                    itemid == 506 ~ valuenum,
+                                    itemid == 6350 ~ valuenum,
+                                    itemid == 50017 ~ valuenum)
+            ) %>%
+            mutate(compliance = case_when(itemid == 131 ~ valuenum)
+            ) %>%
+            mutate(gcs = case_when(itemid == 198 ~ valuenum)
+            ) %>%
+            mutate(wbc = case_when(itemid == 1542 ~ valuenum,
+                                   itemid == 1127 ~ valuenum,
+                                   itemid == 861 ~ valuenum,
+                                   itemid == 4200 ~ valuenum,
+                                   itemid == 50316 ~ valuenum,
+                                   itemid == 50468 ~ valuenum)
+            )%>%
+            mutate(plt = case_when(itemid == 50428 ~ valuenum,
+                                   itemid == 5661 ~ valuenum,
+                                   itemid == 6256 ~ valuenum,
+                                   itemid == 828 ~ valuenum)
+            ) %>%
+            mutate(bilirubine = case_when(itemid == 4948 ~ valuenum, 
+                                   itemid == 50170 ~ valuenum)
+            ) %>%
+            mutate(map = case_when(itemid == 2647 ~ valuenum,
+                                   itemid == 2294 ~ valuenum,
+                                   itemid == 52 ~ valuenum,
+                                   itemid == 6702 ~ valuenum,
+                                   itemid == 6590 ~ valuenum,
+                                   itemid == 6927 ~ valuenum,
+                                   itemid == 5702 ~ valuenum)
+            ) %>%
+            mutate(driving_press = case_when(itemid == 3167 ~ valuenum,
+                                             itemid == 670 ~ valuenum,
+                                             itemid == 7352 ~ valuenum,
+                                             itemid == 7454 ~ valuenum,
+                                             itemid == 6273 ~ valuenum,
+                                             itemid == 7085 ~ valuenum,
+                                             itemid == 5764 ~ valuenum,
+                                             itemid == 2129 ~ valuenum,
+                                             itemid == 6691 ~ valuenum,
+                                             itemid == 7504 ~ valuenum,
+                                             itemid == 6819 ~ valuenum,
+                                             itemid == 1731 ~ valuenum,
+                                             itemid == 7968 ~ valuenum,
+                                             itemid == 6268 ~ valuenum,
+                                             itemid == 7263 ~ valuenum,
+                                             itemid == 5630 ~ valuenum)
+                   ) 
+                                        
+EVENT <- EVENT %>% group_by(icustay_id, subject_id) %>% arrange(icustay_id) 
+EVENT <- dplyr::select(EVENT, -itemid, -value, - valuenum)
+```
+
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+#create our clinical variables
+COdf <- dplyr::select(EVENT, pCO2)
+COdf <- na.omit(COdf)
+O2df <- dplyr::select(EVENT, pO2)
+O2df <- na.omit(O2df)
+O2df <- O2df %>% group_by(icustay_id, subject_id) %>% arrange(icustay_id) %>% filter(row_number()==1)
+FiOdf <- dplyr::select(EVENT, FiO2)
+FiOdf <- na.omit(FiOdf)
+FiOdf <- FiOdf %>% group_by(icustay_id, subject_id) %>% arrange(icustay_id) %>% filter(row_number()==1)
+FiOdf$FiO2 <- ifelse(FiOdf$FiO2 > 1, FiOdf$FiO2/100, FiOdf$FiO2/1)
+FiOdf$FiO2 <- ifelse(FiOdf$FiO2 < 0.21, NA, FiOdf$FiO2/1)
+tidal <- dplyr::select(EVENT, tidal_volume)
+tidal <- na.omit(tidal)
+tidal <- tidal %>% group_by(icustay_id, subject_id) %>% arrange(icustay_id) %>% filter(row_number()==1)
+tidal$tidal_volume <- ifelse(tidal$tidal_volume < 200, NA, tidal$tidal_volume/1)
+plateau <- dplyr::select(EVENT, plateau)
+plateau <- na.omit(plateau)
+peak <- dplyr::select(EVENT, peak)
+peak <- na.omit(peak)
+peak$peak <- ifelse(peak$peak < 10, NA, peak$peak/1)
+peep <- dplyr::select(EVENT, peep)
+peep <- na.omit(peep)
+peep$peep <- ifelse(peep$peep > 30, NA, peep$peep/1)
+peep <- peep %>% group_by(icustay_id, subject_id) %>% arrange(icustay_id) %>% filter(row_number()==1)
+compl <- dplyr::select(EVENT, compliance)
+compl <- na.omit(compl)
+compl$compliance <- ifelse(compl$compliance < 4, NA, compl$compliance/1)
+drive <- dplyr::select(EVENT, driving_press)
+drive <- na.omit(drive)
+drive$driving_press <- ifelse(drive$driving_press > 55, NA, drive$driving_press/1)
+lact <- dplyr::select(EVENT, lactate)
+lact <- na.omit(lact)
+lact <- lact %>% group_by(icustay_id, subject_id) %>% arrange(icustay_id) %>% filter(row_number()==1)
+pH <- dplyr::select(EVENT, pH)
+pH <- na.omit(pH)
+pH$pH <- ifelse(pH$pH > 30, NA, pH$pH/1)
+pH <- pH %>% group_by(icustay_id, subject_id) %>% arrange(icustay_id) %>% filter(row_number()==1)
+crea <- dplyr::select(EVENT, creatinine)
+crea <- na.omit(crea)
+crea <- crea %>% group_by(icustay_id, subject_id) %>% arrange(icustay_id) %>% filter(row_number()==1)
+bili <- dplyr::select(EVENT, bilirubine)
+bili <- na.omit(bili)
+gcs <- dplyr::select(EVENT, gcs)
+gcs <- na.omit(gcs)
+wbc <- dplyr::select(EVENT, wbc)
+wbc <- na.omit(wbc)
+wbc <- wbc %>% group_by(icustay_id, subject_id) %>% arrange(icustay_id) %>% filter(row_number()==1)
+plt <- dplyr::select(EVENT, plt)
+plt <- na.omit(plt)
+plt <- plt %>% group_by(icustay_id, subject_id) %>% arrange(icustay_id) %>% filter(row_number()==1)
+map <- dplyr::select(EVENT, map)
+map <- na.omit(map)
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+#generate our data frame with demographic and clinical variables
+data <- PATIENTS %>% left_join(COdf) %>% left_join(O2df) %>% left_join(FiOdf) %>% left_join(tidal) %>% left_join(plateau) %>% left_join(peak) %>% left_join(peep) %>% left_join(compl) %>% left_join(drive) %>% left_join(lact) %>% left_join(pH) %>% left_join(crea) %>% left_join(bili) %>% left_join(gcs) %>% left_join(wbc) %>% left_join(plt) %>% left_join(map)
+data <- select(data, -icustay_intime)
+head(data)
+
+```
+```{r}
+data <- data %>% 
+              mutate(gender = case_when(gender == "M" ~ 0,
+                                        gender == "F" ~ 1)) %>%
+              mutate(hosp_death = case_when(hosp_death == "N" ~ 0,
+                                            hosp_death == "Y" ~ 1)) %>%
+              mutate(icu_death = case_when(icu_death == "N" ~ 0,
+                                           icu_death == "Y" ~ 1))
+data$gender <- as.factor(data$gender)
+data$hosp_death <- as.factor(data$hosp_death)
+data$icu_death <- as.factor(data$icu_death)
+data$height <- ifelse(data$height > 200, NA, data$height/1)
+data$height <- ifelse(data$height < 120, NA, data$height/1)
+data$weight <- ifelse(data$weight < 30, NA, data$weight/1)
+```
+
+
+```{r}
+data <- data %>% 
+              mutate(diagnosis = case_when(
+                code == "047.9" | code == "052.0" | code ==  "054.3" | code ==  "062.2" | code == "225.2" | code == "237.1" | code == "237.6" | code == "294.8" | code == "300.1" | code == "324.1" | code == "331.0" | code == "333.2" | code == "335.20" | code == "345.3" | code == "345.70" | code == "345.90" | code == "345.91" | code == "348.1" | code == "348.39" | code == "358.0" | code == "430" | code == "431" | code == "432.1" | code == "432.9" | code == "433.01" | code == "433.10" | code == "433.21" | code == "433.31" | code == "434.01" | code == "434.11" | code == "434.91" | code == "436" | code == "437.2" | code == "437.3" | code == "572.2" | code == "721.3" | code == "721.42" | code == "722.0" | code == "724.02" | code == "759.6" | code == "780.39" | code == "996.2" | code == "997.02" | code == "851.02" | code == "851.05" | code == "851.41" | code == "851.45" | code == "851.80" | code == "851.82" | code == "851.85" | code == "851.86" | code == "852.00" | code == "852.01" | code == "852.02" | code == "852.05" | code == "852.06" | code == "852.20" | code == "852.21" | code == "852.22" | code == "852.25" | code == "852.26" | code == "852.39" | code == "853.00" | code == "853.01" | code == "853.05" | code == "853.06" | code == "853.09" | code == "873.9" | code == "804.35" ~ 1,
+                 code == "398.91" | code == "401.0" | code ==  "401.9" | code ==  "402.91" | code == "404.92" | code == "410.01" | code == "410.11" | code == "410.21" | code == "410.31" | code == "410.41" | code == "410.61" | code == "410.71" | code == "410.72" | code == "410.81" | code == "410.91" | code == "414.01" | code == "414.02" | code == "416.0" | code == "420.90" | code == "423.0" | code == "423.9" | code == "425.4" | code == "428.0" | code == "428.30" | code == "428.31" | code == "428.33" | code == "428.40" | code == "428.41" | code == "429.89" | code == "745.4" | code == "785.51" | code == "996.02" | code == "996.71" | code == "997.1" | code == "426.0" | code == "426.12" | code == "427.1" | code == "427.31" | code == "427.32" | code == "427.41" | code == "427.81" | code == "427.89" | code == "427.5" | code == "991.6" ~ 2,
+                code == "998.51" | code == "998.59" | code ==  "995.92" | code ==  "996.61" | code == "996.62" | code == "996.64" | code == "728.86" | code == "730.15" | code == "780.6" | code == "996.68" | code == "008.45" | code == "009.3" | code == "027.2" | code == "038.0" | code == "038.10" | code == "038.11" | code == "038.19" | code == "038.2" | code == "038.3" | code == "038.40" | code == "038.41" | code == "038.42" | code == "038.43" | code == "038.49" | code == "038.8" | code == "038.9" | code == "042" | code == "052.7" | code == "112.4" | code == "112.5" | code == "117.3" | code == "117.5" | code == "136.3" | code == "136.9" | code == "421.0" | code == "424.90" | code == "567.23" | code == "567.2" | code == "576.1" | code == "599.0" | code == "682.6"| code == "117.7" ~ 3,
+                code == "415.19" | code == "458.29" | code ==  "458.8" | code ==  "458.9" | code == "780.2" | code == "578.9" | code == "998.11" | code == "998.12" ~ 4,
+                code == "465.9" | code == "478.74" | code ==  "481" | code ==  "482.0" | code == "482.39" | code == "482.41" | code == "482.83" | code == "482.9" | code == "485" | code == "486" | code == "487.0" | code == "491.21" | code == "496" | code == "507.0" | code == "508.0" | code == "510.0" | code == "510.9" | code == "511.0" | code == "512.8" | code == "515" | code == "516.3" | code == "516.8" | code == "518.5" | code == "518.81" | code == "518.82" | code == "518.84" | code == "519.01" | code == "519.1" | code == "519.19" | code == "530.84" | code == "799.02" | code == "997.3" | code == "039.1" | code == "482.1" | code == "493.22" | code == "493.91" | code == "507.8" ~ 5,
+                code == "530.21" | code == "530.4" | code ==  "530.81" | code ==  "530.82" | code == "531.4" | code == "531.50" | code == "532.00" | code == "532.10" | code == "532.20" | code == "532.40" | code == "532.50" | code == "532.60" | code == "535.41" | code == "535.51" | code == "536.3" | code == "537.3" | code == "555.9" | code == "557.0" | code == "557.1" | code == "558.2" | code == "560.1" | code == "562.11" | code == "562.12" | code == "562.13" | code == "569.69" | code == "569.81" | code == "569.83" | code == "570" | code == "571.2" | code == "571.5" | code == "572.0" | code == "572.3" | code == "577.0" | code == "578.0" | code == "578.1" | code == "789.07" | code == "789.30" | code == "996.82" | code == "997.4"| code == "070.54" | code == "531.40" | code == "577.1" ~ 6,
+            code == "250.10" | code == "250.11" | code ==  "250.13" | code ==  "250.40" | code == "250.41" | code == "250.43" | code == "250.60" | code == "250.63" | code == "250.70" | code == "250.80" | code == "250.82" | code == "250.83" | code == "251.3" | code == "271.8" | code == "276.1" | code == "276.5" | code == "276.51" | code == "276.9" | code == "277.3" | code == "403.01" | code == "403.91" | code == "440.1" | code == "584.5" | code == "584.9" | code == "728.88" | code == "783.7" | code == "996.73" | code == "291.0" | code == "292.81" | code == "571.1" | code == "965.00" | code == "965.01" | code == "965.09" | code == "965.4" | code == "966.1" | code == "966.3" | code == "969.0" | code == "969.8" | code == "980.0" ~ 7,    
+            code ==  "141.8" | code == "143.1" | code ==  "144.0" | code ==  "149.0" | code == "150.4" | code == "150.5" | code == "150.8" | code == "150.9" | code == "151.0" | code == "152.0" | code == "153.1" | code == "153.3" | code == "153.4" | code == "153.6" | code == "153.7" | code == "153.8" | code == "154.0" | code == "154.1" | code == "155.0" | code == "155.1" | code == "155.2" | code == "156.0" | code == "156.2" | code == "156.9" | code == "157.0" | code == "157.1" | code == "157.8" | code == "162.2" | code == "162.3" | code == "162.4" | code == "162.5" | code == "162.8" | code == "164.0" | code == "171.3" | code == "172.0" | code == "173.3" | code == "182.0" | code == "183.0" | code == "184.0" | code == "187.4" | code == "188.8" | code == "189.0" | code == "189.1" | code == "191.0" | code == "191.1" | code == "191.6" | code == "191.8" | code == "191.9" | code == "196.0" | code == "197.0" | code == "197.2" | code == "197.3" | code == "197.4" | code == "197.5" | code == "197.6" | code == "197.7" | code == "198.3" | code == "198.4" | code == "198.5" | code == "198.89" | code == "200.02" | code == "200.03" | code == "200.08" | code == "200.20" | code == "201.50" | code == "202.18" | code == "202.80" | code == "211.2" | code == "220" | code ==  "233.0" | code ==  "235.2" | code == "238.7" | code == "394.1" | code == "394.2" | code == "395.0" | code == "396.0" | code == "396.1" | code == "396.2" | code == "396.3" | code == "396.8" | code == "424.0" | code == "424.1" | code == "440.20" | code == "440.21" | code == "440.22" | code == "440.23" | code == "440.24" | code == "553.21" | code == "553.3" | code == "540.1" | code == "560.2" | code == "560.81" | code == "560.89" | code == "560.9" | code == "566" | code == "574.00" | code == "574.10" | code == "574.41" | code == "574.51" | code == "574.61" | code == "575.10" | code == "576.2" | code == "593.82" | code == "596.1" | code == "596.54" | code == "619.1" | code == "620.2" | code ==  "804.20" | code ==  "804.25" | code == "804.26" | code == "804.85" | code == "805.9" | code == "805.02" | code == "805.04" | code == "805.05" | code == "805.08" | code == "806.00" | code == "806.04" | code == "806.05" | code == "806.07" | code == "806.09" | code == "806.20" | code == "807.03" | code == "808.0" | code == "812.01" | code == "812.31" | code == "813.51" | code == "820.09" | code == "820.21" | code == "820.22" | code == "820.8" | code == "821.11" | code == "821.29" | code == "821.30" | code == "824.5" | code == "835.00" | code == "839.05" | code == "902.87" | code == "901.0" | code == "924.00" | code == "902.29" | code == "969.4" | code == "865.04" | code == "865.13" | code == "868.03" | code == "868.64" | code == "873.0" | code == "875.0" | code == "882.1" | code == "887.2" | code == "860.0" | code == "860.2" | code == "860.4" | code == "863.21" | code == "864.14" | code == "864.19" | code == "865.03" | code == "785.59" | code == "800.15" | code == "800.23" | code == "800.25" | code == "800.26" | code == "800.76" | code == "801.12" | code == "801.16" | code == "801.21" | code == "801.25" | code == "801.22" | code == "801.26" | code == "801.45" | code == "801.82" | code == "802.20" | code == "802.4" | code == "802.6" | code == "803.15" | code == "803.20" | code == "803.21" | code == "803.25" | code == "803.75" | code == "163.8"| code == "164.9" | code == "805.01" | code == "821.21" | code == "868.04" | code == "996.4"~ 8, 
+                code == "070.20" | code == "070.30" | code ==  "070.44" | code ==  "070.45" | code == "203.00" | code == "204.00" | code == "205.00" | code == "283.0" | code == "284.0" | code == "288.0" | code == "288.00" | code == "441.01" | code == "441.02" | code == "441.03" | code == "441.1" | code == "441.2" | code == "441.3" | code == "441.4" | code == "441.6" | code == "441.7" | code == "998.2" | code == "998.31" | code == "998.81" | code == "V58.12" | code == "710.0" | code == "715.95" | code == "728.89" | code == "729.9" | code == "733.13" | code == "733.82" | code == "994.7" | code == "996.44" | code == "996.59" | code == "996.74" | code == "996.79" | code == "996.85" | code == "442.2" | code == "442.84" | code == "440.0" | code == "455.2" | code == "456.0" | code == "459.81" | code == "284.8"| code == "300.01"| code == "440.31" | code == "444.0" | code == "456.8" | code == "459.2" ~ 9 ))
+
+data$diagnosis <- as.factor(data$diagnosis)
+```
+
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+#remove vectors and table we don't need anymore
+rm(bili)
+rm(COdf)
+rm(compl)
+rm(crea)
+rm(drive)
+rm(FiOdf)
+rm(gcs)
+rm(lact)
+rm(map)
+rm(O2df)
+rm(peak)
+rm(peep)
+rm(pH)
+rm(plateau)
+rm(plt)
+rm(tidal)
+rm(wbc)
+rm(CHARTEVENTS)
+rm(DIAGNOSIS)
+rm(EVENTIOT)
+rm(ICUSTAY)
+rm(IOT)
+rm(LAB)
+rm(LABIOT)
+```
+
+
+# DATA CLEANING
+
+```{r}
+sapply(data, function(x) sum(is.na(x)))
+```
+
+```{r echo=TRUE, warning=FALSE}
+#examine the variable with the highest number of missing data
+miss_plot <- aggr(data, col=c('navyblue','yellow'),
+                    numbers=TRUE, sortVars=TRUE,
+                    labels=names(data), cex.axis=.7,
+                    gap=3, ylab=c("Missing data","Pattern"))
+```
+
+
+```{r}
+# recalculating NAs in driving_pressure
+calc_dp <- (data$tidal_volume)/(data$compliance)
+dp <- ifelse(is.na(data$driving_press), calc_dp, data$driving_press/1)
+data$driving_press <- dp
+data$driving_press <- round(data$driving_press, 1)
+```
+
+```{r}
+#recalculate NAs in plateau
+calc_plateau <- (data$driving_press) + (data$peep)
+plat <- ifelse(is.na(data$plateau), calc_plateau, data$plateau/1)
+data$plateau <- plat
+data$plateau <- round(data$plateau, 0)
+```
+
+
+NAs imputation for the rest of the variable that cannot be calculate
+
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+ids <- data[,c(1,2,3,4,31)]
+nas <- data[,5:30]
+categorical <- dplyr::select(nas, gender, icu_death, hosp_death)
+numeric <- dplyr::select(nas, -gender, -icu_death, -hosp_death)
+imputed_num <- mice(numeric, m=3, maxit = 50, method = "pmm", seed = 500)
+imputed_cat <- mice(categorical, m=3, maxit=50, method = "logreg", seed= 500)
+```
+
+```{r echo=TRUE, warning=FALSE}
+summary(imputed_num)
+```
+
+
+```{r}
+summary(imputed_cat)
+```
+
+
+```{r}
+stripplot(imputed_num, pch = 20, cex = 1.2)
+```
+
+Let's use the third iteration
+
+```{r echo=TRUE, warning=FALSE}
+complete_num <- complete(imputed_num, 3)
+complete_cat <- complete(imputed_cat, 3)
+data <- bind_cols(ids, complete_cat, complete_num)
+head(data)
+```
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+#remove vectors and dataframe we don't need anymore
+rm(ids)
+rm(numeric)
+rm(categorical)
+rm(nas)
+rm(imputed_cat)
+rm(imputed_num)
+rm(complete_cat)
+rm(complete_num)
+rm(calc_dp)
+rm(calc_plateau)
+rm(dp)
+rm(plat)
+```
+
+
+# EXPLORATORY DATA ANALYSIS
+
+## Descriptive statistics
+
+
+```{r}
+data <- data %>% add_column(PBW = NA)
+data$PBW <- ifelse(data$gender == "0", (50+(0.91*(data$height - 152.4))), (45+(0.91*(data$height - 152.4))))
+```
+
+```{r}
+data <- data %>% add_column(minute_vol = data$tidal_volume*20)
+```
+
+```{r}
+data <- data %>% add_column(VR = (data$minute_vol*data$pCO2)/(100*data$PBW*37.5))
+```
+
+```{r}
+data <- data %>% add_column(PaFi = data$pO2/data$FiO2)
+```
+
+
+```{r}
+summary(data)
+```
+
+```{r}
+level_sex <- c("0" = "Male", "1" = "Female")
+data$gender <- recode(data$gender, !!!level_sex)
+level_death <- c("0" = "Survivors", "1" = "No Survivors")
+data$icu_death <- recode(data$icu_death, !!!level_death)
+level_diagnosis <- c("1" = "Neurocritic", "2" = "Cardiac", "3" ="Infectious", "4" = "Other Shock",  "5" = "Respiratory", "6" = "Gastrointestinal", "7" = "Renal-metabolic", "8" = "Postoperative-Traumatic", "9" = "Other")
+data$diagnosis <- recode(data$diagnosis, !!!level_diagnosis)
+```
+
+```{r}
+var.labels <- c( age= "Age", gender = "Gender", icustay_los = "ICU lenght of Stay", gcs = "Glasgow Coma Scale", map = "Mean Arterial Pressure", pCO2 = "pCO2", pO2 = "pO2", PaFi = "PaFi", lactate = "Lactate", bilirubine = "Bilirubine", creatinine = "Creatinine", wbc = "White Blood Cells", plt = "Platelets", FiO2 = "FiO2", tidal_volume = "Tidal Volume", peak = "Peak Pressure", plateau = "Plateau Pressure", driving_press = "Driving Pressure", compliance = "Compliance", VR = "Ventilatory Ratio", pH = "pH", peep = "PEEP", diagnosis = "Diagnostic Group", icu_death = "Mortality")
+
+label(data) <- as.list(var.labels[match(names(data), names(var.labels))])
+```
+
+
+```{r}
+table_one <- tableby(icu_death ~ gender + age + icustay_los + gcs + map, data=data)
+summary(table_one, title = "1. Demographic Data")
+```
+
+```{r}
+table_two <- tableby(icu_death ~ pCO2 + pO2 + PaFi + pH + lactate + bilirubine + creatinine + wbc + plt, data=data)
+summary(table_two, title = "2. Laboratory Data")
+```
+
+```{r}
+table_three <- tableby(icu_death ~ FiO2 + tidal_volume + peak + plateau + peep + driving_press + compliance + VR, data=data)
+summary(table_three, title = "3. Respiratory Settings")
+```
+
+
+```{r}
+table_four <- tableby(diagnosis ~ pCO2 + VR, data=data)
+summary(table_four, title = "4. Dead Space by Diagnostic Group")
+```
+
+
+```{r}
+par(mfrow=c(2,2))
+hist(data$age, col = "deepskyblue", xlab="Years", main="Age")
+hist(data$hospital_los, col = "purple", xlab="days", main="Hospital Lenght of stay")
+hist(data$icustay_los, col = "orange", xlab="days", main="ICU Lenght of stay")
+```
+
+
+
+```{r}
+par(mfrow=c(2,2))
+boxplot(age~icu_death, data=data, notch = T, col = "purple", xlab="ICU mortality")
+boxplot(weight~icu_death, data=data, notch = T, col = "yellow", xlab="ICU mortality")
+boxplot(VR~icu_death, data=data, notch = T, col = "red", xlab="ICU mortality")
+boxplot(sofa~icu_death, data=data, notch = T, col = "green", xlab="ICU mortality")
+```
+
+
+```{r}
+par(mfrow=c(3,2))
+hist(data$pO2, col = "deepskyblue", xlab="mmHg", main="pO2")
+hist(data$pCO2, col = "purple", xlab="mmHg", main="pCO2")
+hist(data$tidal_volume, col = "orange", xlab="ml", main="Tidal Volume")
+hist(data$plateau, col = "green", xlab="cmH2O", main="Plateau Pressure")
+hist(data$driving_press, col = "red", xlab="cmH2O", main="Driving Pressure")
+```
+
+```{r}
+par(mfrow=c(3,2))
+hist(data$gcs, col = "deepskyblue", xlab="gcs", main="Glasgow coma scale")
+hist(data$map, col = "purple", xlab="mmHg", main="Mean Arterial pressure")
+hist(data$plt, col = "orange", xlab="×10^9/L", main="Platelets")
+hist(data$wbc, col = "green", xlab="K/uL", main="White blood cells")
+hist(data$creatinine, col = "red", xlab="mg/dl", main="Creatinine")
+hist(data$bilirubine, col = "red", xlab="mg/dl", main="Bilirubine")
+```
+
+```{r}
+par(mfrow=c(2,2))
+hist(data$pH, col = "deepskyblue", xlab="pH", main="pH")
+hist(data$lactate, col = "purple", xlab="mmol/L", main="lactate")
+```
+
+
+```{r}
+some_variable <- data[,c(9, 13, 14, 15, 16, 18, 19, 21, 22, 23, 27, 34, 35)]
+cor <- cor(some_variable)
+cor
+```
+
+```{r}
+corrplot(cor, is.corr = FALSE, method = "square")
+```
+
+```{r}
+variable2 <- data[,c(5, 6, 7, 9, 11, 13, 14, 15, 16, 18, 19, 21, 22, 23, 27, 34)]
+variable2 %>% plot_correlation()
+```
+
+## Logistic Rergression
+
+```{r}
+mylogit <- glm(icu_death ~ VR + PaFi + driving_press + pH + lactate + bilirubine + peep + creatinine + map + diagnosis, data = data, family = "binomial")
+summary(mylogit)
+````
+
+
+```{r}
+wald.test(b = coef(mylogit), Sigma = vcov(mylogit), Terms = 1:7)
+```
+
+```{r}
+tbl_regression(mylogit, exponentiate = TRUE)
+```
+
+
+# Model Training
+
+## K-NN
+
+```{r}
+# create normalization function
+normalize <- function(x) {
+return ((x - min(x)) / (max(x) - min(x))) }
+```
+
+```{r}
+var <- data[,c(14, 15, 16, 17, 18, 21, 22, 23, 24, 25, 26, 27, 34, 35)]
+data_norm <- as.data.frame(lapply(var, normalize)) 
+```
+
+```{r}
+#
+set.seed(12345) 
+sem_norm<-sample(1:nrow(data_norm),round(2*nrow(data_norm)/3,0)) 
+train_norm<-data_norm[sem_norm,] 
+test_norm<-data_norm[-sem_norm,]
+class_train<-data[sem_norm,7] 
+class_test<-data[-sem_norm,7]
+```
+
+
+
+```{r}
+k <- sqrt(2495)
+test_pred <- knn(train = train_norm, test = test_norm, cl = class_train$icu_death, k=k)
+```
+
+
+```{r}
+confusionMatrix(test_pred, class_test$icu_death, positive = "Survivors")
+```
+
+The accuracy is acceptable but the kappa statistics is poor
+
+## Artificial Neural Network
+
+```{r}
+train <- cbind(train_norm, class_train)
+test <- cbind(test_norm, class_test)
+```
+
+
+```{r}
+set.seed(12345)
+data_model <- neuralnet(icu_death ~ ., data = train, hidden=3)
+```
+
+```{r}
+plot(data_model)
+```
+
+
+```{r frag13,warning=FALSE,message=FALSE,tidy=TRUE}
+model_results1 <- compute(data_model,test[, 1:14])$net.result
+
+# Put multiple binary output to categorical output
+maxidx <- function(arr) {
+  return(which(arr == max(arr)))
+}
+
+idx <- apply(model_results1, 1, maxidx)
+prediction <- c('Survivors', 'No Survivors')[idx]
+res <- table(prediction, test$icu_death)
+res
+```
+
+
+```{r}
+#accuracy
+(473+89)/nrow(test)
+```
+
+The accuracy of the model is acceptable
+
+
+### ANN with caret
+
+```{r}
+model <- train(icu_death ~ ., train, method='nnet',
+               trControl= trainControl(method='none'),
+              # preProcess = "range",
+               tuneGrid= NULL, tuneLength=1 ,trace = FALSE) #
+plotnet(model)
+```
+
+```{r}
+summary(model)
+prediction <- predict(model, test[-15])                           # predict
+table(prediction, test$icu_death)                                  # compare
+
+
+```
+
+```{r}
+# predict can also return the probability for each class:
+prediction <- predict(model, test[-15], type="prob")  
+head(prediction)
+```
+
+```{r}
+(470+98)/nrow(test)
+```
+
+
+## Support Vector Machine
+
+
+```{r}
+#sampling
+set.seed(12345) 
+sem<-sample(1:nrow(var),round(2*nrow(var)/3,0)) 
+train1<-var[sem,]
+test1<-var[-sem,]
+# labels 
+class_train1<-data[sem,7] 
+class_test1<-data[-sem,7]
+```
+
+
+```{r}
+set.seed(12345)
+modeloLineal <- ksvm(class_train1$icu_death ~.,data=train1, kernel="vanilladot")
+modeloLineal
+```
+
+```{r}
+modLineal_pred <- predict(modeloLineal, test1)
+table(modLineal_pred, class_test1$icu_death)
+```
+
+```{r}
+agreement_Lineal <- modLineal_pred == class_test1$icu_death
+prop.table(table(agreement_Lineal))
+```
+
+El agreemnt es acceptable
+
+## Random Forest
+
+```{r}
+set.seed(12345)
+rf <- randomForest(class_train1$icu_death ~.,data=train1)
+rf
+```
