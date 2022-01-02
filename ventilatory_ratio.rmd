@@ -511,6 +511,9 @@ boxplot(VR~icu_death, data=data, notch = T, col = "red", xlab="ICU mortality")
 boxplot(sofa~icu_death, data=data, notch = T, col = "green", xlab="ICU mortality")
 ```
 
+```{r}
+mosaicplot(diagnosis~icu_death, xlab= "ICU mortality", ylab="Diagnosis", col=c("cornflowerblue", "coral"), data=data)
+```
 
 ```{r}
 par(mfrow=c(3,2))
